@@ -15,4 +15,6 @@ public class PrecheckRequest {
 
     @NotNull
     private Integer port = 22; // 기본 SSH 포트
+    @NotBlank
+    private String password;   // 나중엔 키 인증도 추가 가능
 }

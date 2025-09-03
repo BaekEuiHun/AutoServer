@@ -11,4 +11,5 @@ public class PrecheckResponse {
     private String targetIp;
     private boolean pingOk;
     private boolean tcp22Ok;
+    private String osName;
 }
