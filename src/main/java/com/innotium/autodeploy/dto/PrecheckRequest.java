@@ -12,6 +12,8 @@ import lombok.NoArgsConstructor;
 public class PrecheckRequest {
     @NotBlank
     private String ip;
+    @NotBlank
+    private String user;
 
     @NotNull
     private Integer port = 22; // 기본 SSH 포트
