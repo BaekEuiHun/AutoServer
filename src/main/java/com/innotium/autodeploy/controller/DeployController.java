@@ -2,16 +2,17 @@ package com.innotium.autodeploy.controller;
 
 import com.innotium.autodeploy.dto.DeployRequest;
 import com.innotium.autodeploy.dto.DeployResponse;
+import com.innotium.autodeploy.dto.Step6MariadbRequest;
 import com.innotium.autodeploy.service.DeployService;
-import com.innotium.autodeploy.support.StepResult;
+import com.innotium.autodeploy.ssh.SSH;
+import com.jcraft.jsch.Session;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
-
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.List;
+
 
 @RestController
 @RequestMapping("/api/deploy")
@@ -47,6 +48,27 @@ public class DeployController {
             error.message = "배포 실패: " + e.getMessage();
             error.logs.add("업로드/임시파일 처리 중 오류: " + e.getMessage());
             return ResponseEntity.internalServerError().body(error);
+        }
+    }
+    @PostMapping("/step6/mariadb")
+    public ResponseEntity<?> step6(@RequestBody Step6MariadbRequest req) {
+        Session s = null;
+        try {
+            // 필요 시 req.port 사용 (없으면 22 기본)
+            s = SSH.open(req.ip, 22, req.user, req.sudoPw);
+
+            // 로그 콜백: 람다 대신 메서드 레퍼런스로 깔끔하게
+            service.step06_mariadb(s, req, System.out::println);
+
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            return ResponseEntity
+                    .internalServerError()
+                    .body("Step6 실패: " + e.getMessage());
+        } finally {
+            if (s != null && s.isConnected()) {
+                s.disconnect();
+            }
         }
     }
 }
