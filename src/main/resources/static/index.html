@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <title>서버 자동구축</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<h1>서버 자동구축</h1>
+
+<section class="card">
+    <h2>대상 서버 정보</h2>
+    <label class="field">IP: <input id="ip" placeholder="192.168.11.103"></label>
+    <label class="field">아이디: <input id="user" placeholder="ehbaek"></label>
+    <label class="field">비밀번호: <input id="password" type="password"></label>
+    <label class="field">포트: <input id="port" type="number" value="22" min="1" max="65535"></label>
+</section>
+
+<section class="card">
+    <h2>사전점검</h2>
+    <div class="actions">
+        <button id="btnPrecheck">사전점검하기</button>
+    </div>
+</section>
+
+<section class="card">
+    <h2>서버구축 시작 (실시간)</h2>
+    <label class="field">WAS.tar 업로드: <input id="wasFile" type="file" /></label>
+    <label class="field">원격 디렉토리: <input id="remoteWorkDir" placeholder="/opt/app"></label>
+    <div class="actions">
+        <button id="btnDeployStream">서버구축하기</button>
+    </div>
+</section>
+
+<section class="card">
+    <h2>진행 로그</h2>
+    <pre id="logs"></pre>
+</section>
+<script>
+    const $ = id => document.getElementById(id);
+    function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+    function formatLine(line){
+        if(line.includes("===== [2]")) return `<span class="chip chip-step">STEP2</span> <span class="log-start">${escapeHtml(line)}</span>`;
+        if(line.includes("===== [3]")) return `<span class="chip chip-step">STEP3</span> <span class="log-start">${escapeHtml(line)}</span>`;
+        if(line.startsWith("✅")) return `<span class="chip chip-done">DONE</span> <span class="log-ok">${escapeHtml(line)}</span>`;
+        if(line.startsWith("➡️")) return `<span class="chip chip-next">NEXT</span> ${escapeHtml(line)}`;
+        if(line.startsWith("[TCP]")||line.startsWith("[SSH]")||line.startsWith("[OS]"))
+            return `<span class="chip chip-step">CHECK</span> ${escapeHtml(line)}`;
+        return escapeHtml(line);
+    }
+    function log(line){
+        const el = $('logs'); const ts = new Date().toLocaleTimeString();
+        el.innerHTML += (el.innerHTML?'<br>':'') + `[${ts}] ` + formatLine(line);
+        el.scrollTop = el.scrollHeight;
+    }
+    function clearLogs(){ $('logs').innerHTML=''; }
+
+    // ─────────────────────────────
+    // 사전점검
+    // ─────────────────────────────
+    $('btnPrecheck').addEventListener('click', async () => {
+        const ip = $('ip').value.trim();
+        const user = $('user').value.trim();
+        const password = $('password').value;
+        const port = parseInt(($('port').value||'22'),10);
+        if(!ip||!user){ alert('IP와 아이디를 입력하세요.'); return; }
+        clearLogs(); $('btnPrecheck').disabled = true; log('사전점검 요청 전송...');
+        try{
+            const res = await fetch('/api/precheck', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({ ip, port, user, password })
+            });
+            if(!res.ok) throw new Error('HTTP '+res.status);
+            const data = await res.json();
+            log('=== 사전점검 응답 ===');
+            (data.logs||[]).forEach(line=>log(line));
+            log((data.pingOk && data.tcpOk) ? '사전점검 성공 ✅' : '사전점검 일부 실패 ⚠️');
+        }catch(e){ log('사전점검 실패 ❌: '+e.message);
+        }finally{ $('btnPrecheck').disabled = false; }
+    });
+
+    // ─────────────────────────────
+    // 실시간 서버구축(SSE)
+    // ─────────────────────────────
+    $('btnDeployStream').addEventListener('click', async () => {
+        const fileInput = $('wasFile');
+        const ip = $('ip').value.trim();
+        const user = $('user').value.trim();
+        const password = $('password').value;
+        const port = parseInt(($('port').value||'22'),10);
+        const remoteWorkDir = $('remoteWorkDir').value.trim();
+        if(!fileInput.files[0]||!ip||!user||!remoteWorkDir){
+            alert('필수값(WAS.tar/IP/아이디/원격 디렉토리)을 모두 입력하세요.'); return;
+        }
+
+        clearLogs();
+        $('btnDeployStream').disabled = true;
+        log('실시간 서버구축 시작(SSE) 진행중입니다....');
+
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        formData.append('ip', ip);
+        formData.append('port', port);
+        formData.append('user', user);
+        formData.append('password', password);
+        formData.append('remoteWorkDir', remoteWorkDir);
+
+        try{
+            const res = await fetch('/api/deploy/stream', { method:'POST', body: formData });
+            if(!res.ok || !res.body){ throw new Error('HTTP '+res.status); }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while(true){
+                const {done, value} = await reader.read();
+                if(done) break;
+                buffer += decoder.decode(value, {stream:true});
+
+                // SSE: 공백 라인(\n\n)으로 이벤트 블록 구분, "data:" 라인만 표시
+                const blocks = buffer.split('\n\n');
+                buffer = blocks.pop();
+                for(const blk of blocks){
+                    const line = blk.split('\n').find(l => l.startsWith('data:'));
+                    if(line){
+                        const msg = line.slice(5).trim();
+                        if(msg) log(msg);
+                    }
+                }
+            }
+            // 남은 버퍼 처리
+            if(buffer.startsWith('data:')){
+                const msg = buffer.slice(5).trim();
+                if(msg) log(msg);
+            }
+            log('실시간 서버구축 종료 ✅');
+        }catch(e){
+            log('실시간 서버구축 에러 ❌: '+e.message);
+        }finally{
+            $('btnDeployStream').disabled = false;
+        }
+    });
+</script>
+</body>
+</html>
