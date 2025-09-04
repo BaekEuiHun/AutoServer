@@ -2,11 +2,11 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8" />
-    <title>서버 자동구축</title>
+    <title>서버 원클릭 구축</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<h1>서버 자동구축</h1>
+<h1>서버 원클릭 구축</h1>
 
 <section class="card">
     <h2>대상 서버 정보</h2>
@@ -42,6 +42,7 @@
     function formatLine(line){
         if(line.includes("===== [2]")) return `<span class="chip chip-step">STEP2</span> <span class="log-start">${escapeHtml(line)}</span>`;
         if(line.includes("===== [3]")) return `<span class="chip chip-step">STEP3</span> <span class="log-start">${escapeHtml(line)}</span>`;
+        if(line.includes("===== [4]")) return `<span class="chip chip-step">STEP4</span> <span class="log-start">${escapeHtml(line)}</span>`;
         if(line.startsWith("✅")) return `<span class="chip chip-done">DONE</span> <span class="log-ok">${escapeHtml(line)}</span>`;
         if(line.startsWith("➡️")) return `<span class="chip chip-next">NEXT</span> ${escapeHtml(line)}`;
         if(line.startsWith("[TCP]")||line.startsWith("[SSH]")||line.startsWith("[OS]"))
@@ -95,7 +96,7 @@
 
         clearLogs();
         $('btnDeployStream').disabled = true;
-        log('실시간 서버구축 시작(SSE) 진행중입니다....');
+        log('실시간 서버구축이 진행중입니다....');
 
         const formData = new FormData();
         formData.append('file', fileInput.files[0]);

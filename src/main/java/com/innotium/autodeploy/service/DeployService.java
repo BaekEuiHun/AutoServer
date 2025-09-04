@@ -61,6 +61,13 @@ public class DeployService {
             step03_jdk8_tomcat(logger, s, os, req.password());
             logger.accept("✅  [3] JDK8/Tomcat 완료");
             logger.accept("🎉 전체 배포 완료 ✅");
+            logger.accept("✅  [3] JDK8/Tomcat 완료");
+            logger.accept("➡️   [4] Nginx 리버스 프록시 단계를 시작합니다...");
+
+            logger.accept("===== [4] Nginx Reverse Proxy 시작 =====");
+            step04_nginx(logger, s, os, req.password());
+            logger.accept("✅  [4] Nginx Reverse Proxy 완료");
+            logger.accept("🎉 전체 배포 완료 ✅");
 
         } catch (Exception e) {
             logger.accept("배포 실패 ❌: " + e.getMessage());
@@ -271,11 +278,14 @@ echo "[3] STEP3 DONE OK"
         String b64 = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_8));
 
 // 2) 원격에서 디코딩→저장→실행 (heredoc 사용 안 함)
-        String cmd =
-                "base64 -d >/tmp/step3.sh <<'B64'\n" + b64 + "\nB64\n" +
-                        "sed -i 's/\\r$//' /tmp/step3.sh\n" +
-                        "chmod +x /tmp/step3.sh\n" +
-                        "/bin/sh -x /tmp/step3.sh\n";
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step3.sh <<'B64'",
+                b64,
+                "B64",
+                "sed -i 's/\\r$//' /tmp/step3.sh",
+                "chmod +x /tmp/step3.sh",
+                "/bin/sh -x /tmp/step3.sh"
+        );
 
 // 3) 루트로 실행
         var r = SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", sudoPw);
@@ -287,6 +297,153 @@ echo "[3] STEP3 DONE OK"
         if (r.code() != 0) throw new RuntimeException("JDK8/Tomcat 설치 실패: " + msg);
         log.accept("  - 설치/기동 로그:\\n" + msg);
         log.accept("[3] JDK 8 + Tomcat 9.0.80 설치/기동 완료 ✅ (브라우저: http://<서버IP>:8080)");
+    }
+    private void step04_nginx(Consumer<String> log, Session s, String osIgnored, String sudoPw) throws Exception {
+        log.accept("[4] Nginx 설치/설정/기동 시작 ▶");
+
+        // 1) 쉘 스크립트(내부 sudo 금지!)
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[4] STEP4 START"
+
+# 0) 패키지 매니저 감지 + nginx 설치 보장
+PM=""
+if command -v apt-get >/dev/null 2>&1; then
+  PM=apt
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y nginx curl sed
+elif command -v dnf >/dev/null 2>&1; then
+  PM=dnf
+  dnf -y install nginx curl policycoreutils-python-utils sed
+elif command -v yum >/dev/null 2>&1; then
+  PM=yum
+  yum -y install nginx curl policycoreutils-python-utils sed
+else
+  echo "[4] no package manager"; exit 1
+fi
+
+# nginx 바이너리 확인
+command -v nginx >/dev/null 2>&1 || { echo "[4] nginx command not found after install"; exit 1; }
+
+# 1) Tomcat 포트 8081 보장
+CONF="/opt/tomcat/latest/conf/server.xml"
+if [ -f "$CONF" ] && grep -q 'Connector port="8080"' "$CONF"; then
+  sed -i 's/Connector port="8080"/Connector port="8081"/' "$CONF"
+  systemctl restart tomcat || true
+fi
+
+# 2) Nginx 프록시 설정 (40000 → 8081)
+mkdir -p /etc/nginx/conf.d
+cat >/etc/nginx/conf.d/autodeploy.conf <<'NGX'
+server {
+    listen 40000 default_server;
+    listen [::]:40000 default_server;
+    server_name _;
+
+    client_max_body_size 200m;
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_pass http://127.0.0.1:8081;
+    }
+}
+NGX
+
+# Ubuntu에서 conf.d 미포함 환경 대비
+if ! nginx -T 2>/dev/null | grep -q "/etc/nginx/conf.d/"; then
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  cat >/etc/nginx/sites-available/autodeploy <<'NGX'
+server {
+    listen 40000 default_server;
+    listen [::]:40000 default_server;
+    server_name _;
+    location / { proxy_pass http://127.0.0.1:8081; }
+}
+NGX
+  ln -sfn /etc/nginx/sites-available/autodeploy /etc/nginx/sites-enabled/autodeploy
+fi
+
+# 3) 방화벽/SELinux
+command -v ufw >/dev/null 2>&1 && ufw allow 40000/tcp || true
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --add-port=40000/tcp --permanent || true
+  firewall-cmd --reload || true
+fi
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce || true)" = "Enforcing" ]; then
+  semanage port -l | grep -qE '^http_port_t.*\\b40000\\b' || semanage port -a -t http_port_t -p tcp 40000 || true
+  setsebool -P httpd_can_network_connect 1 || true
+fi
+
+# 4) 로그 디렉터리 보장
+mkdir -p /var/log/nginx
+chown root:adm /var/log/nginx || true
+
+# 5) Nginx 구문검사/기동
+echo "[4] nginx -t"
+nginx -t || { echo "[4][DIAG] nginx -T ====="; nginx -T || true; echo "[4] nginx -t failed"; exit 1; }
+
+systemctl enable nginx || true
+systemctl restart nginx || {
+  echo "[4][DIAG] journalctl -u nginx ====="
+  journalctl -u nginx --no-pager -n 200 || true
+  echo "[4][DIAG] /var/log/nginx/error.log ====="
+  tail -n 200 /var/log/nginx/error.log || true
+  echo "[4] nginx restart failed"; exit 1;
+}
+
+# 6) 헬스체크
+code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:40000/ || true)
+echo "[4] curl 127.0.0.1:40000 => HTTP ${code}"
+case "$code" in
+  200|302|403|404) echo "[4] STEP4 DONE OK";;
+  *) echo "[4] Nginx proxy healthcheck failed (HTTP ${code})"; exit 1;;
+esac
+""";
+
+
+        // 1) 스크립트 본문은 그대로 둡니다 (String script = """ ... """;)
+        String safeScript = script.replace("sudo ", "");
+
+// 2) Base64 인코딩
+        String b64 = Base64.getEncoder()
+                .encodeToString(safeScript.getBytes(StandardCharsets.UTF_8));
+
+// 3) 원격에 디코딩하여 저장 → CRLF 제거 → 권한 부여 → 문법검사 → 실행
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step4.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step4.sh > /tmp/.step4.tmp && mv /tmp/.step4.tmp /tmp/step4.sh",
+                "chmod +x /tmp/step4.sh",
+                "echo '[4] bash -n syntax check:'",
+                "if ! bash -n /tmp/step4.sh; then",
+                "  echo '[4][DIAG] ===== numbered dump (1..200) ====='; nl -ba /tmp/step4.sh | sed -n '1,200p' ;",
+                "  exit 1;",
+                "fi",
+                "echo '[4] RUN /bin/bash -x /tmp/step4.sh'",
+                "/bin/bash -x /tmp/step4.sh",
+                "echo '[4] script DONE'"
+        );
+
+        var r = SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", sudoPw);
+        String out = r.out() == null ? "" : r.out().trim();
+        String err = r.err() == null ? "" : r.err().trim();
+        String msg = (!out.isBlank() && !err.isBlank()) ? out + "\n" + err : (!out.isBlank() ? out : err);
+        if (r.code() != 0) throw new RuntimeException("Nginx 설정 실패(code=" + r.code() + "): " + msg);
+
+        log.accept("  - Nginx 설치/설정 로그:\n" + msg);
+        log.accept("[4] Nginx 리버스 프록시 설정/기동 완료 ✅ (브라우저: http://<서버IP>:40000)");
+
     }
 
     private String pickMsg(SSH.Result r) {
