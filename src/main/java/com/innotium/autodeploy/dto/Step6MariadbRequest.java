@@ -19,4 +19,5 @@ public class Step6MariadbRequest {
 
     // 바인드 로컬 전용(내부통신): true 권장
     public boolean bindLocalOnly = true;
+    public String dbRootPassword;
 }

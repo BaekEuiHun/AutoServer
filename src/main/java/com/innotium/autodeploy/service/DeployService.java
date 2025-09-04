@@ -474,19 +474,140 @@ esac
         log.accept("[4] Nginx 리버스 프록시 설정/기동 완료 ✅ (브라우저: http://<서버IP>:40000)");
 
     }
-    public void step06_mariadb(Session s,
-                               Step6MariadbRequest req,
-                               Consumer<String> log) {
+    public void step06_mariadb(Session s, Step6MariadbRequest req, java.util.function.Consumer<String> log) {
         log.accept("[6] MariaDB 설치/설정 시작 ▶");
 
-        String script = """
-        #!/usr/bin/env bash
-        set -Eeuo pipefail
-        echo "[6] MariaDB install placeholder"
-        exit 0
-        """;
+        String ROOTPW = req.dbRootPassword == null ? "" : req.dbRootPassword;
+        String APPDB  = req.appDbName == null ? "innoapp" : req.appDbName;
+        String APPUSR = req.appDbUser == null ? "innoapp" : req.appDbUser;
+        String APPPW  = req.appDbPass == null ? "S3cure!234" : req.appDbPass;
+        int PORT      = (req.mariadbPort <= 0 ? 43306 : req.mariadbPort);
+        String BIND   = (req.bindLocalOnly ? "127.0.0.1" : "0.0.0.0");
 
-        String b64 = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_8));
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[6] STEP6 START"
+
+PORT=%PORT%
+BIND="%BIND%"
+APPDB='%APPDB%'
+APPUSR='%APPUSR%'
+APPPW='%APPPW%'
+ROOTPW='%ROOTPW%'
+
+# 0) 패키지 매니저 감지 (Ubuntu/Rocky 자동)
+PM=""
+if command -v apt-get >/dev/null 2>&1; then
+  PM=apt
+  export DEBIAN_FRONTEND=noninteractive
+elif command -v dnf >/dev/null 2>&1; then
+  PM=dnf
+elif command -v yum >/dev/null 2>&1; then
+  PM=yum
+else
+  echo "[6] no package manager"; exit 1
+fi
+
+# 1) MariaDB 설치
+if [ "$PM" = "apt" ]; then
+  apt-get update -y || true
+  apt-get install -y mariadb-server || true
+else
+  $PM -y install mariadb-server || true
+fi
+
+# 2) 설정 파일 (Debian/Ubuntu vs RHEL/Rocky 경로 차이 처리)
+DEB_DIR="/etc/mysql/mariadb.conf.d"
+RHEL_DIR="/etc/my.cnf.d"
+mkdir -p "$DEB_DIR" "$RHEL_DIR" || true
+
+if [ -d "$DEB_DIR" ]; then
+  CONF="$DEB_DIR/99-autodeploy.cnf"
+  SOCK="/var/run/mysqld/mysqld.sock"
+else
+  CONF="$RHEL_DIR/99-autodeploy.cnf"
+  SOCK="/var/lib/mysql/mysql.sock"
+fi
+
+cat > "$CONF" <<EOF
+[mysqld]
+port = %PORT%
+bind-address = %BIND%
+socket = $SOCK
+max_connections = 300
+character-set-server = utf8mb4
+collation-server = utf8mb4_general_ci
+skip-name-resolve
+EOF
+
+# 3) 기동/활성화
+systemctl enable mariadb || true
+systemctl restart mariadb
+
+# 4) 방화벽/SELinux (외부 바인딩시에만)
+if [ "%BIND%" != "127.0.0.1" ]; then
+  if command -v ufw >/dev/null 2>&1; then ufw allow %PORT%/tcp || true; fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --add-port=%PORT%/tcp --permanent || true
+    firewall-cmd --reload || true
+  fi
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce || true)" = "Enforcing" ]; then
+    # http/nginx와 달리 mysqld는 별도 타입
+    if ! semanage port -l | grep -qE '^mysqld_port_t.*\\b%PORT%\\b'; then
+      semanage port -a -t mysqld_port_t -p tcp %PORT% || true
+    fi
+  fi
+fi
+
+# 5) 루트 접속/비번 처리 (ubuntu 기본 unix_socket 고려)
+SQL() {
+  if [ -n "$ROOTPW" ]; then mysql -u root -p"$ROOTPW" -e "$1"; else mysql -u root -e "$1" || mysql --protocol=socket -u root -e "$1"; fi
+}
+
+# 필요 시 루트 비번/플러그인 교체
+if [ -n "$ROOTPW" ]; then
+  mysql -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$ROOTPW'; FLUSH PRIVILEGES;" \
+    || mysql --protocol=socket -u root -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '$ROOTPW'; FLUSH PRIVILEGES;" || true
+
+  mysql -u root -e "UPDATE mysql.user SET plugin='mysql_native_password' WHERE User='root' AND Host='localhost'; FLUSH PRIVILEGES;" \
+    || mysql --protocol=socket -u root -e "UPDATE mysql.user SET plugin='mysql_native_password' WHERE User='root' AND Host='localhost'; FLUSH PRIVILEGES;" || true
+  systemctl restart mariadb || true
+fi
+
+# 6) 헬스체크
+if [ -n "$ROOTPW" ]; then mysqladmin -u root -p"$ROOTPW" ping || true; else mysqladmin -u root ping || mysqladmin --protocol=socket -u root ping || true; fi
+
+# 7) 앱DB/계정
+if [ -n "$ROOTPW" ]; then
+  mysql -u root -p"$ROOTPW" -e "CREATE DATABASE IF NOT EXISTS \\`$APPDB\\` DEFAULT CHARACTER SET utf8mb4;"
+  mysql -u root -p"$ROOTPW" -e "CREATE USER IF NOT EXISTS '$APPUSR'@'%' IDENTIFIED BY '$APPPW';"
+  mysql -u root -p"$ROOTPW" -e "GRANT ALL PRIVILEGES ON \\`$APPDB\\`.* TO '$APPUSR'@'%'; FLUSH PRIVILEGES;"
+else
+  mysql -u root -e "CREATE DATABASE IF NOT EXISTS \\`$APPDB\\` DEFAULT CHARACTER SET utf8mb4;" \
+    || mysql --protocol=socket -u root -e "CREATE DATABASE IF NOT EXISTS \\`$APPDB\\` DEFAULT CHARACTER SET utf8mb4;"
+  mysql -u root -e "CREATE USER IF NOT EXISTS '$APPUSR'@'%' IDENTIFIED BY '$APPPW';" \
+    || mysql --protocol=socket -u root -e "CREATE USER IF NOT EXISTS '$APPUSR'@'%' IDENTIFIED BY '$APPPW';"
+  mysql -u root -e "GRANT ALL PRIVILEGES ON \\`$APPDB\\`.* TO '$APPUSR'@'%'; FLUSH PRIVILEGES;" \
+    || mysql --protocol=socket -u root -e "GRANT ALL PRIVILEGES ON \\`$APPDB\\`.* TO '$APPUSR'@'%'; FLUSH PRIVILEGES;"
+fi
+
+mysql --version || true
+echo "[6] MariaDB PORT=%PORT%, BIND=%BIND%"
+echo "[6] APP DB=$APPDB, USER=$APPUSR"
+echo "[6] STEP6 DONE OK"
+""";
+
+        script = script
+                .replace("%PORT%", String.valueOf(PORT))
+                .replace("%BIND%", BIND)
+                .replace("%APPDB%", APPDB)
+                .replace("%APPUSR%", APPUSR)
+                .replace("%APPPW%", APPPW)
+                .replace("%ROOTPW%", ROOTPW);
+
+        String b64 = java.util.Base64.getEncoder().encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
         String cmd = String.join("\n",
                 "base64 -d >/tmp/step6.sh <<'B64'",
                 b64,
@@ -501,19 +622,14 @@ esac
         );
 
         try {
-            var r = SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"", "\\\"") + "\"", req.sudoPw);
+            var r = SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", req.sudoPw);
             String out = r.out() == null ? "" : r.out().trim();
             String err = r.err() == null ? "" : r.err().trim();
-            String msg = (!out.isBlank() && !err.isBlank())
-                    ? out + "\n" + err
-                    : (!out.isBlank() ? out : err);
-
-            if (r.code() != 0) {
-                throw new RuntimeException("MariaDB 설치/설정 실패(code=" + r.code() + "): " + msg);
-            }
+            String msg = (!out.isBlank() && !err.isBlank()) ? out + "\n" + err : (!out.isBlank() ? out : err);
+            if (r.code() != 0) throw new RuntimeException("MariaDB 설치/설정 실패(code=" + r.code() + "): " + msg);
 
             log.accept("  - MariaDB 설치/설정 로그:\n" + msg);
-            log.accept("[6] MariaDB 설치/설정 완료 ✅ (내부포트: " + req.mariadbPort + ")");
+            log.accept("[6] MariaDB 설치/설정 완료 ✅ (포트: " + PORT + ", 바인딩: " + BIND + ")");
         } catch (Exception e) {
             throw new RuntimeException("MariaDB 설치/설정 실패: " + e.getMessage(), e);
         }
