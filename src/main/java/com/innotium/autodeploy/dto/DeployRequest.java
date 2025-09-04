@@ -8,3 +8,4 @@ public record DeployRequest(
         String wasTarPath,    // (백엔드 로컬) 업로드할 WAS.tar 경로
         String remoteWorkDir  // (원격) 작업 디렉토리 예: /opt/app
 ) {}
+

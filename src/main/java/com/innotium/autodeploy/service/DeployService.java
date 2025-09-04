@@ -2,6 +2,7 @@ package com.innotium.autodeploy.service;
 
 import com.innotium.autodeploy.dto.DeployRequest;
 import com.innotium.autodeploy.dto.DeployResponse;
+import com.innotium.autodeploy.dto.Step6MariadbRequest;
 import com.innotium.autodeploy.ssh.SSH;
 import com.jcraft.jsch.Session;
 import org.springframework.stereotype.Service;
@@ -12,6 +13,28 @@ import java.util.function.Consumer;
 
 @Service
 public class DeployService {
+
+    private com.innotium.autodeploy.dto.Step6MariadbRequest toStep6Req(DeployRequest req) {
+        var r = new com.innotium.autodeploy.dto.Step6MariadbRequest();
+        r.ip = req.ip();
+        r.user = req.user();
+        r.sudoPw = req.password();         // sudo/ssh 동일 가정
+
+        // 회사 정책 기본값
+        r.mariadbMajorMinor = "10.11";
+        r.mariadbPort = 43306;
+        r.bindLocalOnly = true;
+
+        // 앱 DB 계정 (원하면 여기 값 바꿔도 됨)
+        r.appDbName = "innoapp";
+        r.appDbUser = "innoapp";
+        r.appDbPass = "S3cure!234";
+
+        // (선택) root 비번을 DeployRequest에 넣었다면 세팅 (없으면 null/빈문자 그대로)
+        // r.dbRootPassword = req.dbRootPassword();
+
+        return r;
+    }
 
     /**
      * 기존 REST 방식: 끝나고 한 번에 결과 반환
@@ -60,14 +83,20 @@ public class DeployService {
             logger.accept("===== [3] JDK8/Tomcat 시작 =====");
             step03_jdk8_tomcat(logger, s, os, req.password());
             logger.accept("✅  [3] JDK8/Tomcat 완료");
-            logger.accept("🎉 전체 배포 완료 ✅");
             logger.accept("✅  [3] JDK8/Tomcat 완료");
             logger.accept("➡️   [4] Nginx 리버스 프록시 단계를 시작합니다...");
 
             logger.accept("===== [4] Nginx Reverse Proxy 시작 =====");
             step04_nginx(logger, s, os, req.password());
             logger.accept("✅  [4] Nginx Reverse Proxy 완료");
-            logger.accept("🎉 전체 배포 완료 ✅");
+            logger.accept("➡️   [6] MariaDB 단계를 시작합니다...");
+
+// [6] MariaDB  ★ 추가
+            logger.accept("===== [6] MariaDB 시작 =====");
+            step06_mariadb(s, toStep6Req(req), line -> logger.accept(line));// ← 아래 보조 메서드 참고
+            logger.accept("✅  [6] MariaDB 완료");
+
+
 
         } catch (Exception e) {
             logger.accept("배포 실패 ❌: " + e.getMessage());
@@ -444,6 +473,50 @@ esac
         log.accept("  - Nginx 설치/설정 로그:\n" + msg);
         log.accept("[4] Nginx 리버스 프록시 설정/기동 완료 ✅ (브라우저: http://<서버IP>:40000)");
 
+    }
+    public void step06_mariadb(Session s,
+                               Step6MariadbRequest req,
+                               Consumer<String> log) {
+        log.accept("[6] MariaDB 설치/설정 시작 ▶");
+
+        String script = """
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+        echo "[6] MariaDB install placeholder"
+        exit 0
+        """;
+
+        String b64 = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_8));
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step6.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step6.sh > /tmp/.step6.tmp && mv /tmp/.step6.tmp /tmp/step6.sh",
+                "chmod +x /tmp/step6.sh",
+                "echo '[6] bash -n syntax check:'",
+                "bash -n /tmp/step6.sh || { echo '[6][DIAG] numbered dump:'; nl -ba /tmp/step6.sh; exit 1; }",
+                "echo '[6] RUN /bin/bash -x /tmp/step6.sh'",
+                "/bin/bash -x /tmp/step6.sh",
+                "echo '[6] script DONE'"
+        );
+
+        try {
+            var r = SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"", "\\\"") + "\"", req.sudoPw);
+            String out = r.out() == null ? "" : r.out().trim();
+            String err = r.err() == null ? "" : r.err().trim();
+            String msg = (!out.isBlank() && !err.isBlank())
+                    ? out + "\n" + err
+                    : (!out.isBlank() ? out : err);
+
+            if (r.code() != 0) {
+                throw new RuntimeException("MariaDB 설치/설정 실패(code=" + r.code() + "): " + msg);
+            }
+
+            log.accept("  - MariaDB 설치/설정 로그:\n" + msg);
+            log.accept("[6] MariaDB 설치/설정 완료 ✅ (내부포트: " + req.mariadbPort + ")");
+        } catch (Exception e) {
+            throw new RuntimeException("MariaDB 설치/설정 실패: " + e.getMessage(), e);
+        }
     }
 
     private String pickMsg(SSH.Result r) {
