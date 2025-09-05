@@ -35,6 +35,15 @@ public class DeployService {
 
         return r;
     }
+    private com.innotium.autodeploy.dto.Step5RedisRequest toStep5Req(DeployRequest req) {
+        var r = new com.innotium.autodeploy.dto.Step5RedisRequest();
+        r.ip = req.ip();
+        r.user = req.user();
+        r.sudoPw = req.password();  // sudo/ssh 동일 가정
+        r.redisPort = 46379;
+        r.bindLocalOnly = true;     // 내부 전용 권장
+        return r;
+    }
 
     /**
      * 기존 REST 방식: 끝나고 한 번에 결과 반환
@@ -84,18 +93,20 @@ public class DeployService {
             step03_jdk8_tomcat(logger, s, os, req.password());
             logger.accept("✅  [3] JDK8/Tomcat 완료");
             logger.accept("✅  [3] JDK8/Tomcat 완료");
-            logger.accept("➡️   [4] Nginx 리버스 프록시 단계를 시작합니다...");
-
-            logger.accept("===== [4] Nginx Reverse Proxy 시작 =====");
-            step04_nginx(logger, s, os, req.password());
-            logger.accept("✅  [4] Nginx Reverse Proxy 완료");
-            logger.accept("➡️   [6] MariaDB 단계를 시작합니다...");
+            logger.accept("➡️   [4] MariaDB 단계를 시작합니다...");
 
 // [6] MariaDB  ★ 추가
-            logger.accept("===== [6] MariaDB 시작 =====");
+            logger.accept("===== [4] MariaDB 시작 =====");
             step06_mariadb(s, toStep6Req(req), line -> logger.accept(line));// ← 아래 보조 메서드 참고
-            logger.accept("✅  [6] MariaDB 완료");
-
+            logger.accept("✅  [4] MariaDB 완료");
+            // [5] Redis  ★ 추가
+            logger.accept("===== [5] Redis 시작 =====");
+            step05_redis(s, toStep5Req(req), line -> logger.accept(line));
+            logger.accept("✅  [5] Redis 완료");
+            logger.accept("➡️   [6] Nginx 리버스 프록시 단계를 시작합니다...");
+            logger.accept("===== [6] Nginx Reverse Proxy 시작 =====");
+            step04_nginx(logger, s, os, req.password());
+            logger.accept("✅  [6] Nginx Reverse Proxy 완료");
 
 
         } catch (Exception e) {
@@ -157,119 +168,56 @@ public class DeployService {
         log.accept("[3] JDK 8 + Tomcat 9.0.80 설치/기동 시작. 진행중입니다... ▶");
 
         String script = """
-#!/usr/bin/env sh
-set -eu
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-echo "[3] start"
+echo "[3.0] STEP3 START"
 TVER=9.0.80
+TPORT=8081
 
-# 1) 패키지 매니저 감지 + 기본 도구
+# 1) 패키지 매니저 감지
 PM=""
 if command -v apt-get >/dev/null 2>&1; then
   PM=apt
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y || true
-  apt-get install -y curl wget tar ca-certificates file || true
+  apt-get update -y
+  apt-get install -y curl wget tar ca-certificates file
 elif command -v dnf >/dev/null 2>&1; then
   PM=dnf
-  dnf -y install curl wget tar ca-certificates file || true
+  dnf -y install curl wget tar ca-certificates file
 elif command -v yum >/dev/null 2>&1; then
   PM=yum
-  yum -y install curl wget tar ca-certificates file || true
+  yum -y install curl wget tar ca-certificates file
 else
-  echo "[3] no package manager"; exit 1
+  echo "[3.1] no package manager"; exit 1
 fi
 
-# 2) JDK8 설치 (패키지 → 실패 시 tarball)
-JAVA_OK=0
-if command -v javac >/dev/null 2>&1 && javac -version 2>&1 | grep -q "1\\.8\\."; then
-  JAVA_OK=1
-else
+# 2) JDK8 설치
+if ! java -version 2>&1 | grep -q "1\\.8\\."; then
   if [ "$PM" = "apt" ]; then
-    apt-get install -y openjdk-8-jdk || true
+    apt-get install -y openjdk-8-jdk
   else
-    $PM -y install java-1.8.0-openjdk-devel || true
-  fi
-  if command -v javac >/dev/null 2>&1 && javac -version 2>&1 | grep -q "1\\.8\\."; then
-    JAVA_OK=1
+    $PM -y install java-1.8.0-openjdk-devel
   fi
 fi
+java -version
 
-# --- tarball 대체: 단순 다중 소스 + 검증 후에만 tar ---
-if [ "$JAVA_OK" -ne 1 ]; then
-  mkdir -p /opt/java
-  rm -f /tmp/jdk8.tar.gz
-
-  for URL in \
-    "https://corretto.aws/downloads/latest/amazon-corretto-8-x64-linux-jdk.tar.gz" \
-    "https://github.com/adoptium/temurin8-binaries/releases/latest/download/OpenJDK8U-jdk_x64_linux_hotspot.tar.gz" \
-    "https://cdn.azul.com/zulu/bin/zulu8-latest-linux_x64.tar.gz"
-  do
-    echo "[3] try JDK8 from: $URL"
-    if command -v curl >/dev/null 2>&1; then
-      curl -fL --retry 5 --retry-delay 2 --retry-all-errors -o /tmp/jdk8.tar.gz "$URL" || true
-    else
-      wget -O /tmp/jdk8.tar.gz --tries=5 --waitretry=2 "$URL" || true
-    fi
-    if [ -s /tmp/jdk8.tar.gz ]; then
-      MT=$(file -b --mime-type /tmp/jdk8.tar.gz || true)
-      if [ "$MT" = "application/gzip" ] || [ "$MT" = "application/x-gzip" ]; then
-        if tar -tzf /tmp/jdk8.tar.gz >/dev/null 2>&1; then
-          break
-        fi
-      fi
-      rm -f /tmp/jdk8.tar.gz
-    fi
-    sleep 2
-  done
-
-  if [ ! -s /tmp/jdk8.tar.gz ]; then
-    echo "[3] JDK8 tarball download failed (all sources)"; exit 1
-  fi
-
-  tar -xf /tmp/jdk8.tar.gz -C /opt/java
-  JDIR=$(tar -tf /tmp/jdk8.tar.gz | head -1 | cut -d/ -f1)
-  [ -d "/opt/java/$JDIR" ] || { echo "[3] Unexpected JDK tar structure"; exit 1; }
-  ln -sfn "/opt/java/$JDIR" /opt/java/jdk8
-  ln -sfn /opt/java/jdk8/bin/java /usr/local/bin/java
-  ln -sfn /opt/java/jdk8/bin/javac /usr/local/bin/javac
-fi
-
-# 최종 JAVA_HOME 계산
-if command -v javac >/dev/null 2>&1; then
-  JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
-else
-  echo "[3] javac not found"; exit 1
-fi
-echo "[3] JAVA_HOME=${JAVA_HOME}"
-java -version || true
-
-# 3) Tomcat 9.0.80 설치/기동 (간단 재시도)
+# 3) Tomcat 설치
 id tomcat >/dev/null 2>&1 || useradd -r -m -U -d /opt/tomcat -s /bin/false tomcat
 mkdir -p /opt/tomcat
-cd /tmp
+cd /opt/tomcat
 
-i=0
-while [ $i -lt 3 ]; do
-  if command -v curl >/dev/null 2>&1; then
-    curl -fLO "https://archive.apache.org/dist/tomcat/tomcat-9/v${TVER}/bin/apache-tomcat-${TVER}.tar.gz" || true
-  else
-    wget -O "apache-tomcat-${TVER}.tar.gz" "https://archive.apache.org/dist/tomcat/tomcat-9/v${TVER}/bin/apache-tomcat-${TVER}.tar.gz" || true
-  fi
-  if [ -s "apache-tomcat-${TVER}.tar.gz" ]; then
-    break
-  fi
-  i=`expr $i + 1`
-  sleep 2
-done
-[ -s "apache-tomcat-${TVER}.tar.gz" ] || { echo "[3] Tomcat tarball download failed"; exit 1; }
-
-rm -rf /opt/tomcat/latest
-tar -xf "apache-tomcat-${TVER}.tar.gz"
-mv "apache-tomcat-${TVER}" /opt/tomcat/latest
+rm -rf apache-tomcat-* latest
+curl -fLO "https://archive.apache.org/dist/tomcat/tomcat-9/v${TVER}/bin/apache-tomcat-${TVER}.tar.gz"
+tar -xzf "apache-tomcat-${TVER}.tar.gz"
+mv "apache-tomcat-${TVER}" latest
 chown -R tomcat:tomcat /opt/tomcat
 chmod +x /opt/tomcat/latest/bin/*.sh
 
+# 4) 포트 변경 (8080 → 8081)
+sed -i 's/Connector port="8080"/Connector port="8081"/' /opt/tomcat/latest/conf/server.xml
+
+# 5) systemd 서비스
 cat >/etc/systemd/system/tomcat.service <<EOT
 [Unit]
 Description=Apache Tomcat ${TVER}
@@ -279,27 +227,21 @@ After=network.target
 Type=forking
 User=tomcat
 Group=tomcat
-Environment=JAVA_HOME=${JAVA_HOME}
+Environment=JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))
 Environment=CATALINA_HOME=/opt/tomcat/latest
-Environment=CATALINA_BASE=/opt/tomcat/latest
 ExecStart=/opt/tomcat/latest/bin/startup.sh
 ExecStop=/opt/tomcat/latest/bin/shutdown.sh
-SuccessExitStatus=143
 Restart=on-failure
-RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOT
 
-if command -v ufw >/dev/null 2>&1; then ufw allow 8080/tcp || true; fi
-if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --add-port=8080/tcp --permanent || true; firewall-cmd --reload || true; fi
-
 systemctl daemon-reload
 systemctl enable tomcat
-systemctl restart tomcat || { journalctl -u tomcat --no-pager | tail -100; exit 1; }
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/ || true
-echo "[3] STEP3 DONE OK"
+systemctl restart tomcat
+
+echo "[3.9] Tomcat running on port ${TPORT}"
 """;
 
         // ★ heredoc 꼭 개행으로 닫기!
@@ -632,6 +574,137 @@ echo "[6] STEP6 DONE OK"
             log.accept("[6] MariaDB 설치/설정 완료 ✅ (포트: " + PORT + ", 바인딩: " + BIND + ")");
         } catch (Exception e) {
             throw new RuntimeException("MariaDB 설치/설정 실패: " + e.getMessage(), e);
+        }
+    }
+    public void step05_redis(Session s, com.innotium.autodeploy.dto.Step5RedisRequest req,
+                             java.util.function.Consumer<String> log) {
+        log.accept("[5] Redis 설치/설정 시작 ▶");
+
+        int PORT = (req.redisPort <= 0 ? 46379 : req.redisPort);
+        String BIND = (req.bindLocalOnly ? "127.0.0.1" : "0.0.0.0");
+
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[5] STEP5 START"
+
+PORT=%PORT%
+BIND="%BIND%"
+
+# 0) 패키지 매니저 감지 (Ubuntu/Rocky 자동)
+PM=""
+if command -v apt-get >/dev/null 2>&1; then
+  PM=apt
+  export DEBIAN_FRONTEND=noninteractive
+elif command -v dnf >/dev/null 2>&1; then
+  PM=dnf
+elif command -v yum >/dev/null 2>&1; then
+  PM=yum
+else
+  echo "[5] no package manager"; exit 1
+fi
+
+# 1) Redis 설치
+if [ "$PM" = "apt" ]; then
+  apt-get update -y || true
+  apt-get install -y redis-server || apt-get install -y redis || true
+else
+  $PM -y install redis || $PM -y install redis6 || true
+fi
+
+# 2) 설정파일 경로 확인 (Ubuntu/Rocky 공통적으로 /etc/redis/redis.conf 사용)
+CONF="/etc/redis/redis.conf"
+if [ ! -f "$CONF" ]; then
+  # Debian/Ubuntu 일부는 /etc/redis/redis.conf, RHEL 계열도 동일이 일반적
+  echo "[5] redis.conf not found at $CONF"; ls -l /etc/redis || true
+fi
+
+# 3) 설정 백업
+cp -a "$CONF" "${CONF}.bak.$(date +%F-%H%M%S)" || true
+
+# 4) 바인드/포트/관리 설정
+# - 포트: 46379(권장)
+# - 바인드: 127.0.0.1(내부 전용) 또는 0.0.0.0
+# - supervised systemd, daemonize no
+# - protected-mode 기본값은 보안상 on 유지
+sed -i 's/^#\\? *port .*/port '"$PORT"'/g' "$CONF" || true
+if grep -qE '^#?\\s*bind\\b' "$CONF"; then
+  sed -i 's/^#\\?\\s*bind.*/bind '"$BIND"'/g' "$CONF" || true
+else
+  echo "bind $BIND" >> "$CONF"
+fi
+if grep -qE '^#?\\s*supervised\\b' "$CONF"; then
+  sed -i 's/^#\\?\\s*supervised.*/supervised systemd/g' "$CONF" || true
+else
+  echo "supervised systemd" >> "$CONF"
+fi
+if grep -qE '^#?\\s*daemonize\\b' "$CONF"; then
+  sed -i 's/^#\\?\\s*daemonize.*/daemonize no/g' "$CONF" || true
+else
+  echo "daemonize no" >> "$CONF"
+fi
+
+# 5) 서비스 이름 차이 고려(RHEL=redis, Ubuntu=redis-server). 둘 다 시도
+systemctl daemon-reload || true
+systemctl enable --now redis 2>/dev/null || systemctl enable --now redis-server 2>/dev/null || true
+systemctl restart redis 2>/dev/null || systemctl restart redis-server 2>/dev/null || true
+
+# 6) 방화벽/SELinux (외부 바인딩시에만)
+if [ "$BIND" != "127.0.0.1" ]; then
+  if command -v ufw >/dev/null 2>&1; then ufw allow "$PORT"/tcp || true; fi
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    firewall-cmd --add-port="$PORT"/tcp --permanent || true
+    firewall-cmd --reload || true
+  fi
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce || true)" = "Enforcing" ]; then
+    # Redis는 보통 외부 포트에 대한 별도 SELinux 타입 설정 없이도 동작, 필요 시 추가 조치
+    :
+  fi
+fi
+
+# 7) 헬스체크
+which redis-cli >/dev/null 2>&1 || { echo "[5] redis-cli not found"; exit 1; }
+ss -lntp | sed -n '1,200p' | grep ":${PORT}\\b" || true
+redis-cli -p "$PORT" ping || true
+
+echo "[5] Redis PORT=$PORT, BIND=$BIND"
+echo "[5] STEP5 DONE OK"
+""";
+
+        script = script
+                .replace("%PORT%", String.valueOf(PORT))
+                .replace("%BIND%", BIND);
+
+        String b64 = java.util.Base64.getEncoder()
+                .encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step5.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step5.sh > /tmp/.step5.tmp && mv /tmp/.step5.tmp /tmp/step5.sh",
+                "chmod +x /tmp/step5.sh",
+                "echo '[5] bash -n syntax check:'",
+                "bash -n /tmp/step5.sh || { echo '[5][DIAG] numbered dump:'; nl -ba /tmp/step5.sh; exit 1; }",
+                "echo '[5] RUN /bin/bash -x /tmp/step5.sh'",
+                "/bin/bash -x /tmp/step5.sh",
+                "echo '[5] script DONE'"
+        );
+
+        try {
+            var r = com.innotium.autodeploy.ssh.SSH.execRoot(s,
+                    "bash -lc \"" + cmd.replace("\"","\\\"") + "\"",
+                    req.sudoPw);
+            String out = r.out() == null ? "" : r.out().trim();
+            String err = r.err() == null ? "" : r.err().trim();
+            String msg = (!out.isBlank() && !err.isBlank()) ? out + "\n" + err : (!out.isBlank() ? out : err);
+            if (r.code() != 0) throw new RuntimeException("Redis 설치/설정 실패(code=" + r.code() + "): " + msg);
+
+            log.accept("  - Redis 설치/설정 로그:\n" + msg);
+            log.accept("[5] Redis 설치/설정 완료 ✅ (포트: " + PORT + ", 바인딩: " + BIND + ")");
+        } catch (Exception e) {
+            throw new RuntimeException("Redis 설치/설정 실패: " + e.getMessage(), e);
         }
     }
 
