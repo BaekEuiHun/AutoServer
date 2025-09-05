@@ -63,6 +63,52 @@ public class DeployController {
             if (s != null && s.isConnected()) s.disconnect();
         }
     }
+    @PostMapping("/step4/nginx")
+    public ResponseEntity<?> step4(@RequestParam String ip,
+                                   @RequestParam String user,
+                                   @RequestParam String sudoPw) {
+        com.jcraft.jsch.Session s = null;
+        try {
+            s = com.innotium.autodeploy.ssh.SSH.open(ip, 22, user, sudoPw);
+            // OS 감지는 내부 스크립트에서 패키지 매니저로 자동 처리됨
+            service.getClass(); // 서비스 인스턴스 존재 보장용 no-op
+            // DeployService에 public 메서드면 직접 호출, private이면 runAll 내 순서로만 실행
+            java.lang.reflect.Method m = service.getClass().getDeclaredMethod(
+                    "step04_nginx", java.util.function.Consumer.class, com.jcraft.jsch.Session.class, String.class, String.class);
+            m.setAccessible(true);
+            m.invoke(service, (java.util.function.Consumer<String>)System.out::println, s, "unknown", sudoPw);
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Step4 실패: " + e.getMessage());
+        } finally {
+            if (s != null && s.isConnected()) s.disconnect();
+        }
+    }
+    @PostMapping("/step7/scouter")
+    public ResponseEntity<?> step7(@RequestParam String ip,
+                                   @RequestParam String user,
+                                   @RequestParam String sudoPw) {
+        com.jcraft.jsch.Session s = null;
+        try {
+            s = com.innotium.autodeploy.ssh.SSH.open(ip, 22, user, sudoPw);
+            // OS는 스크립트 내부에서 패키지 매니저로 처리
+            // 리플렉션 없이 public으로 빼도 되고, private이면 아래처럼 변경
+            java.lang.reflect.Method m = service.getClass().getDeclaredMethod(
+                    "step07_scouter",
+                    java.util.function.Consumer.class,
+                    com.jcraft.jsch.Session.class,
+                    String.class,
+                    String.class
+            );
+            m.setAccessible(true);
+            m.invoke(service, (java.util.function.Consumer<String>)System.out::println, s, "unknown", sudoPw);
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Step7 실패: " + e.getMessage());
+        } finally {
+            if (s != null && s.isConnected()) s.disconnect();
+        }
+    }
 
     @PostMapping("/step6/mariadb")
     public ResponseEntity<?> step6(@RequestBody Step6MariadbRequest req) {
