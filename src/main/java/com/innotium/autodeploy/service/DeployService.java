@@ -107,6 +107,10 @@ public class DeployService {
             logger.accept("===== [6] Nginx Reverse Proxy 시작 =====");
             step04_nginx(logger, s, os, req.password());
             logger.accept("✅  [6] Nginx Reverse Proxy 완료");
+            logger.accept("➡️   [7] Scouter 단계를 시작합니다...");
+            logger.accept("===== [7] Scouter 시작 =====");
+            step07_scouter(logger, s, os, req.password());
+            logger.accept("✅  [7] Scouter 완료");
 
 
         } catch (Exception e) {
@@ -115,6 +119,7 @@ public class DeployService {
             if (s != null && s.isConnected()) s.disconnect();
         }
     }
+
 
     /**
      * 2단계: WAS 패키지 업로드 + 필수 패키지 설치 + 압축해제
@@ -270,7 +275,7 @@ echo "[3.9] Tomcat running on port ${TPORT}"
         log.accept("[3] JDK 8 + Tomcat 9.0.80 설치/기동 완료 ✅ (브라우저: http://<서버IP>:8080)");
     }
     private void step04_nginx(Consumer<String> log, Session s, String osIgnored, String sudoPw) throws Exception {
-        log.accept("[4] Nginx 설치/설정/기동 시작 ▶");
+        log.accept("[6] Nginx 설치/설정/기동 시작 ▶");
 
         // 1) 쉘 스크립트(내부 sudo 금지!)
         String script = """
@@ -413,11 +418,11 @@ esac
         if (r.code() != 0) throw new RuntimeException("Nginx 설정 실패(code=" + r.code() + "): " + msg);
 
         log.accept("  - Nginx 설치/설정 로그:\n" + msg);
-        log.accept("[4] Nginx 리버스 프록시 설정/기동 완료 ✅ (브라우저: http://<서버IP>:40000)");
+        log.accept("[6] Nginx 리버스 프록시 설정/기동 완료 ✅ (브라우저: http://<서버IP>:40000)");
 
     }
     public void step06_mariadb(Session s, Step6MariadbRequest req, java.util.function.Consumer<String> log) {
-        log.accept("[6] MariaDB 설치/설정 시작 ▶");
+        log.accept("[4] MariaDB 설치/설정 시작 ▶");
 
         String ROOTPW = req.dbRootPassword == null ? "" : req.dbRootPassword;
         String APPDB  = req.appDbName == null ? "innoapp" : req.appDbName;
@@ -571,7 +576,7 @@ echo "[6] STEP6 DONE OK"
             if (r.code() != 0) throw new RuntimeException("MariaDB 설치/설정 실패(code=" + r.code() + "): " + msg);
 
             log.accept("  - MariaDB 설치/설정 로그:\n" + msg);
-            log.accept("[6] MariaDB 설치/설정 완료 ✅ (포트: " + PORT + ", 바인딩: " + BIND + ")");
+            log.accept("[4] MariaDB 설치/설정 완료 ✅ (포트: " + PORT + ", 바인딩: " + BIND + ")");
         } catch (Exception e) {
             throw new RuntimeException("MariaDB 설치/설정 실패: " + e.getMessage(), e);
         }
@@ -707,6 +712,168 @@ echo "[5] STEP5 DONE OK"
             throw new RuntimeException("Redis 설치/설정 실패: " + e.getMessage(), e);
         }
     }
+    private void step07_scouter(java.util.function.Consumer<String> log,
+                                com.jcraft.jsch.Session s,
+                                String osIgnored, String sudoPw) throws Exception {
+        log.accept("[7] Scouter 설치/에이전트 연동 시작 ▶");
+
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[7] STEP7 START"
+
+SCOUTER_DIR="/opt/scouter"
+TOMCAT_HOME="/opt/tomcat/latest"
+SCOUTER_PORT=6100
+COLLECTOR_IP="127.0.0.1"   # 같은 서버에 Scouter Server 실행(기본)
+OBJ_NAME="tomcat-$(hostname -s)"
+
+# 0) 패키지 매니저 감지 + 필수 도구
+PM=""
+if command -v apt-get >/dev/null 2>&1; then
+  PM=apt
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || true
+  apt-get install -y curl tar sed || true
+elif command -v dnf >/dev/null 2>&1; then
+  PM=dnf
+  dnf -y install curl tar sed || true
+elif command -v yum >/dev/null 2>&1; then
+  PM=yum
+  yum -y install curl tar sed || true
+else
+  echo "[7] no package manager"; exit 1
+fi
+
+# 1) Scouter 최신 릴리스 버전 탐색(실패 시 고정버전 사용)
+VER="$(curl -fsSL https://api.github.com/repos/scouter-project/scouter/releases/latest | sed -n 's/.*"tag_name":[ \t]*"v\\?\\([0-9.]*\\)".*/\\1/p' | head -n1 || true)"
+if [ -z "$VER" ]; then VER="2.20.0"; fi
+URL="https://github.com/scouter-project/scouter/releases/download/v${VER}/scouter-all-${VER}.tar.gz"
+
+mkdir -p "$SCOUTER_DIR"
+cd "$SCOUTER_DIR"
+
+echo "[7] 다운로드: $URL"
+if ! curl -fL "$URL" -o scouter-all.tgz; then
+  echo "[7] 최신 다운로드 실패 → 고정버전 2.20.0 재시도"
+  VER="2.20.0"
+  URL="https://github.com/scouter-project/scouter/releases/download/v${VER}/scouter-all-${VER}.tar.gz"
+  curl -fL "$URL" -o scouter-all.tgz
+fi
+
+rm -rf "./scouter-all-${VER}" "./latest"
+tar -xzf scouter-all.tgz
+mv "scouter-all-${VER}" latest
+
+# 2) Server 설치(systemd 등록)
+# 디렉터리 구조: /opt/scouter/latest/server /opt/scouter/latest/agent.java
+install -d /opt/scouter/server /opt/scouter/agent.java
+
+# server/agent 복사
+rsync -a --delete "/opt/scouter/latest/server/" "/opt/scouter/server/"
+rsync -a --delete "/opt/scouter/latest/agent.java/" "/opt/scouter/agent.java/"
+
+# 서버 환경 파일 보정(데몬 형태로 실행되도록)
+# 최신 스크립트는 startup.sh 제공. systemd 단에서 실행 관리.
+cat >/etc/systemd/system/scouter-server.service <<'UNIT'
+[Unit]
+Description=Scouter Collector Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scouter/server
+ExecStart=/opt/scouter/server/startup.sh
+ExecStop=/opt/scouter/server/shutdown.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable scouter-server || true
+systemctl restart scouter-server || true
+
+# 3) 방화벽/SELinux (Collector 6100/TCP)
+command -v ufw >/dev/null 2>&1 && ufw allow ${SCOUTER_PORT}/tcp || true
+if command -v firewall-cmd >/dev/null 2>&1; then
+  firewall-cmd --add-port=${SCOUTER_PORT}/tcp --permanent || true
+  firewall-cmd --reload || true
+fi
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce || true)" = "Enforcing" ]; then
+  # http_port_t가 아니라 별도 타입 필요 없음(일반 TCP listen). 필요한 경우 추가 정책 적용.
+  :
+fi
+
+# 4) Tomcat Java Agent 연동
+install -d /opt/scouter/agent.java/conf
+cat >/opt/scouter/agent.java/conf/scouter.conf <<EOF
+net_collector_ip=${COLLECTOR_IP}
+net_collector_udp_port=${SCOUTER_PORT}
+net_collector_tcp_port=${SCOUTER_PORT}
+obj_name=${OBJ_NAME}
+# 필요시 추가 옵션:
+# hook_method_patterns=org.apache..*,com.innotium..*
+EOF
+
+SETENV="$TOMCAT_HOME/bin/setenv.sh"
+touch "$SETENV"
+chmod +x "$SETENV"
+
+if ! grep -q "scouter.agent.jar" "$SETENV"; then
+  cat >>"$SETENV" <<'EOT'
+# ----- Scouter Java Agent -----
+SCOUTER_AGENT=/opt/scouter/agent.java
+export CATALINA_OPTS="$CATALINA_OPTS -javaagent:${SCOUTER_AGENT}/lib/scouter.agent.jar -Dscouter.config=${SCOUTER_AGENT}/conf/scouter.conf"
+EOT
+fi
+
+# 5) Tomcat 재기동
+systemctl restart tomcat || true
+
+# 6) 헬스체크
+echo "[7] listening ports (6100 expected):"
+ss -lntp | sed -n '1,200p' | grep ':6100' || true
+
+echo "[7] scouter-server status:"
+systemctl --no-pager -l status scouter-server || true
+
+echo "[7] TOMCAT JAVA_OPTS with agent?"
+grep -n "scouter.agent.jar" "$SETENV" || true
+
+echo "[7] STEP7 DONE OK"
+""";
+
+        String b64 = java.util.Base64.getEncoder()
+                .encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step7.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step7.sh > /tmp/.step7.tmp && mv /tmp/.step7.tmp /tmp/step7.sh",
+                "chmod +x /tmp/step7.sh",
+                "echo '[7] bash -n syntax check:'",
+                "bash -n /tmp/step7.sh || { echo '[7][DIAG] numbered dump:'; nl -ba /tmp/step7.sh; exit 1; }",
+                "echo '[7] RUN /bin/bash -x /tmp/step7.sh'",
+                "/bin/bash -x /tmp/step7.sh",
+                "echo '[7] script DONE'"
+        );
+
+        var r = com.innotium.autodeploy.ssh.SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", sudoPw);
+        String out = r.out() == null ? "" : r.out().trim();
+        String err = r.err() == null ? "" : r.err().trim();
+        String msg = (!out.isBlank() && !err.isBlank()) ? out + "\n" + err : (!out.isBlank() ? out : err);
+        if (r.code() != 0) throw new RuntimeException("Scouter 설치/연동 실패(code=" + r.code() + "): " + msg);
+
+        log.accept("  - Scouter 설치/연동 로그:\n" + msg);
+        log.accept("[7] Scouter 설치/에이전트 연동 완료 ✅ (Collector: 127.0.0.1:6100, Agent: Tomcat)");
+    }
+
 
     private String pickMsg(SSH.Result r) {
         String out = r.out() == null ? "" : r.out().trim();
