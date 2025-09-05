@@ -111,6 +111,12 @@ public class DeployService {
             logger.accept("===== [7] Scouter 시작 =====");
             step07_scouter(logger, s, os, req.password());
             logger.accept("✅  [7] Scouter 완료");
+            logger.accept("➡️   [8] Security/Firewall 단계를 시작합니다...");
+            step08_security(logger, s, os, req.password());
+            logger.accept("✅  [8] Security/Firewall 완료");
+            logger.accept("➡️   [9] 로그 수집 & 헬스체크 단계를 시작합니다...");
+            step09_health(logger, s, os, req.password());
+            logger.accept("✅  [9] 로그 수집 & 헬스체크 완료");
 
 
         } catch (Exception e) {
@@ -1009,6 +1015,158 @@ echo "[8] STEP8 DONE OK"
 
         log.accept("  - Security/Firewall 로그:\n" + msg);
         log.accept("[8] Security/Firewall 설정 완료 ✅");
+    }
+    private void step09_health(java.util.function.Consumer<String> log,
+                               com.jcraft.jsch.Session s,
+                               String osIgnored, String sudoPw) throws Exception {
+        log.accept("[9] 로그 수집 & 헬스체크 시작 ▶");
+
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TS="$(date +%Y%m%d-%H%M%S)"
+OUTDIR="/opt/autodeploy/health"
+OUT="${OUTDIR}/report-${TS}.txt"
+
+WEB_PORT=40000
+TOMCAT_PORT=8081
+DB_PORT=43306
+REDIS_PORT=46379
+SCOUTER_PORT=6100
+
+mkdir -p "$OUTDIR"
+
+{
+  echo "===== AUTO-DEPLOY HEALTH REPORT ${TS} ====="
+  echo
+
+  echo "## 0. System Basics"
+  uname -a || true
+  echo
+  echo "Time: $(date)"
+  echo "Uptime: $(uptime || true)"
+  echo
+
+  echo "## 1. Listening Ports"
+  ss -lntp | sed -n '1,200p' || true
+  echo
+
+  echo "## 2. NGINX"
+  which nginx && nginx -v 2>&1 || echo "nginx not installed"
+  echo
+  echo "nginx config test:"
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t 2>&1 || true
+  fi
+  echo
+  echo "nginx service status:"
+  systemctl --no-pager -l status nginx 2>&1 || true
+  echo
+  echo "nginx last 200 error.log lines:"
+  tail -n 200 /var/log/nginx/error.log 2>&1 || true
+  echo
+  echo "curl http://127.0.0.1:${WEB_PORT}/"
+  curl -s -o /dev/null -w 'HTTP %{http_code}\\n' "http://127.0.0.1:${WEB_PORT}/" || true
+  echo
+
+  echo "## 3. Tomcat"
+  echo "Tomcat service status:"
+  systemctl --no-pager -l status tomcat 2>&1 || true
+  echo
+  echo "Tomcat catalina.out (last 200 lines):"
+  CATALINA_OUT="/opt/tomcat/latest/logs/catalina.out"
+  tail -n 200 "$CATALINA_OUT" 2>&1 || echo "$CATALINA_OUT not found"
+  echo
+
+  echo "## 4. MariaDB"
+  mysql --version 2>&1 || echo "mysql client not installed"
+  echo
+  echo "MariaDB service status:"
+  systemctl --no-pager -l status mariadb 2>&1 || true
+  echo
+  echo "MariaDB TCP check:"
+  ss -lntp | grep -E ":${DB_PORT}\\b" || echo "no LISTEN on ${DB_PORT}"
+  echo
+  echo "MariaDB ping (socket or tcp):"
+  mysqladmin -u root ping 2>&1 || mysqladmin --protocol=socket -u root ping 2>&1 || true
+  echo
+
+  echo "## 5. Redis"
+  which redis-cli >/dev/null 2>&1 && redis-cli -p "${REDIS_PORT}" ping || echo "redis-cli missing or not responding"
+  echo
+  echo "Redis service status:"
+  systemctl --no-pager -l status redis 2>&1 || systemctl --no-pager -l status redis-server 2>&1 || true
+  echo
+  echo "Redis TCP check:"
+  ss -lntp | grep -E ":${REDIS_PORT}\\b" || echo "no LISTEN on ${REDIS_PORT}"
+  echo
+
+  echo "## 6. Scouter"
+  echo "Scouter server status:"
+  systemctl --no-pager -l status scouter-server 2>&1 || true
+  echo
+  echo "Scouter TCP check:"
+  ss -lntp | grep -E ":${SCOUTER_PORT}\\b" || echo "no LISTEN on ${SCOUTER_PORT}"
+  echo
+  echo "Tomcat agent setenv.sh lines:"
+  grep -n "scouter.agent.jar" /opt/tomcat/latest/bin/setenv.sh 2>&1 || echo "no scouter agent line"
+  echo
+
+  echo "## 7. Disk/Memory"
+  df -h || true
+  echo
+  free -h || true
+  echo
+
+  echo "## 8. Journal (recent)"
+  echo "- nginx last 100 lines"
+  journalctl -u nginx --no-pager -n 100 2>&1 || true
+  echo
+  echo "- tomcat last 100 lines"
+  journalctl -u tomcat --no-pager -n 100 2>&1 || true
+  echo
+  echo "- mariadb last 100 lines"
+  journalctl -u mariadb --no-pager -n 100 2>&1 || true
+  echo
+  echo "- redis/redis-server last 100 lines"
+  journalctl -u redis --no-pager -n 100 2>&1 || journalctl -u redis-server --no-pager -n 100 2>&1 || true
+  echo
+  echo "- scouter-server last 100 lines"
+  journalctl -u scouter-server --no-pager -n 100 2>&1 || true
+  echo
+
+  echo "===== END OF REPORT ====="
+} > "$OUT"
+
+echo "[9] Report saved to: $OUT"
+echo "[9] STEP9 DONE OK"
+""";
+
+        String b64 = java.util.Base64.getEncoder()
+                .encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step9.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step9.sh > /tmp/.step9.tmp && mv /tmp/.step9.tmp /tmp/step9.sh",
+                "chmod +x /tmp/step9.sh",
+                "echo '[9] bash -n syntax check:'",
+                "bash -n /tmp/step9.sh || { echo '[9][DIAG] numbered dump:'; nl -ba /tmp/step9.sh; exit 1; }",
+                "echo '[9] RUN /bin/bash -x /tmp/step9.sh'",
+                "/bin/bash -x /tmp/step9.sh",
+                "echo '[9] script DONE'"
+        );
+
+        var r = com.innotium.autodeploy.ssh.SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", sudoPw);
+        String out = r.out() == null ? "" : r.out().trim();
+        String err = r.err() == null ? "" : r.err().trim();
+        String msg = (!out.isBlank() && !err.isBlank()) ? out + "\n" + err : (!out.isBlank() ? out : err);
+        if (r.code() != 0) throw new RuntimeException("Health Check 실패(code=" + r.code() + "): " + msg);
+
+        log.accept("  - Health Check 로그:\n" + msg);
+        log.accept("[9] 로그 수집 & 헬스체크 완료 ✅");
     }
 
 
