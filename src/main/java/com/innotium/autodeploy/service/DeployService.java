@@ -873,6 +873,143 @@ echo "[7] STEP7 DONE OK"
         log.accept("  - Scouter 설치/연동 로그:\n" + msg);
         log.accept("[7] Scouter 설치/에이전트 연동 완료 ✅ (Collector: 127.0.0.1:6100, Agent: Tomcat)");
     }
+    private void step08_security(java.util.function.Consumer<String> log,
+                                 com.jcraft.jsch.Session s,
+                                 String osIgnored, String sudoPw) throws Exception {
+        log.accept("[8] Security/Firewall 설정 시작 ▶");
+
+        String script = """
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "[8] STEP8 START"
+
+# === 기본 포트 정책 ===
+# 반드시 외부 오픈: SSH(22), WEB(40000), Scouter Collector(6100)
+# 내부 전용(기본): MariaDB(43306), Redis(46379)
+# 외부로 열고 싶으면 아래 변수 yes 로 변경(컨트롤러에서 옵션 연동 가능)
+OPEN_DB="no"
+OPEN_REDIS="no"
+
+WEB_PORT=40000
+SCOUTER_PORT=6100
+DB_PORT=43306
+REDIS_PORT=46379
+
+# 0) 패키지 매니저 / 도구 확인
+PM=""
+if command -v apt-get >/dev/null 2>&1; then
+  PM=apt
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || true
+  apt-get install -y ufw curl sed || true
+elif command -v dnf >/dev/null 2>&1; then
+  PM=dnf
+  dnf -y install firewalld curl policycoreutils-python-utils sed || true
+elif command -v yum >/dev/null 2>&1; then
+  PM=yum
+  yum -y install firewalld curl policycoreutils-python-utils sed || true
+else
+  echo "[8] no package manager"; exit 1
+fi
+
+# 1) UFW(focal 등 Ubuntu) 또는 firewalld(RHEL/Rocky) 감지
+HAVE_UFW=0
+HAVE_FWD=0
+if command -v ufw >/dev/null 2>&1; then
+  HAVE_UFW=1
+fi
+if command -v firewall-cmd >/dev/null 2>&1; then
+  HAVE_FWD=1
+fi
+
+# 2) UFW 정책
+if [ "$HAVE_UFW" -eq 1 ]; then
+  echo "[8] Configure UFW"
+  ufw status || true
+  yes | ufw enable || true
+
+  # 기본 정책: inbound deny, outbound allow 유지
+  ufw allow 22/tcp || true
+  ufw allow "${WEB_PORT}"/tcp || true
+  ufw allow "${SCOUTER_PORT}"/tcp || true
+
+  if [ "$OPEN_DB" = "yes" ]; then ufw allow "${DB_PORT}"/tcp || true; fi
+  if [ "$OPEN_REDIS" = "yes" ]; then ufw allow "${REDIS_PORT}"/tcp || true; fi
+
+  echo "[8] UFW Rules:"
+  ufw status numbered || true
+fi
+
+# 3) firewalld 정책
+if [ "$HAVE_FWD" -eq 1 ]; then
+  echo "[8] Configure firewalld"
+  systemctl enable --now firewalld || true
+  firewall-cmd --permanent --add-service=ssh || true
+  firewall-cmd --permanent --add-port=${WEB_PORT}/tcp || true
+  firewall-cmd --permanent --add-port=${SCOUTER_PORT}/tcp || true
+  if [ "$OPEN_DB" = "yes" ]; then firewall-cmd --permanent --add-port=${DB_PORT}/tcp || true; fi
+  if [ "$OPEN_REDIS" = "yes" ]; then firewall-cmd --permanent --add-port=${REDIS_PORT}/tcp || true; fi
+  firewall-cmd --reload || true
+
+  echo "[8] firewalld Active Zones:"
+  firewall-cmd --get-active-zones || true
+  echo "[8] firewalld Open Ports:"
+  firewall-cmd --list-all || true
+fi
+
+# 4) SELinux(Enforcing일 때) 포트 라벨 보정
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce || true)" = "Enforcing" ]; then
+  echo "[8] SELinux detected: Enforcing"
+  # Nginx(40000)는 http_port_t로 라벨 필요 (Nginx 단계에서 이미 처리했지만 재확인)
+  semanage port -l | grep -qE '^http_port_t.*\\b'"${WEB_PORT}"'\\b' || \
+    semanage port -a -t http_port_t -p tcp "${WEB_PORT}" || true
+
+  # MariaDB 외부 오픈 시에는 mysqld_port_t 라벨 필요
+  if [ "$OPEN_DB" = "yes" ]; then
+    semanage port -l | grep -qE '^mysqld_port_t.*\\b'"${DB_PORT}"'\\b' || \
+      semanage port -a -t mysqld_port_t -p tcp "${DB_PORT}" || true
+  fi
+fi
+
+# 5) SSH 최소 하드닝(옵션) - root 로그인/패스워드 로그인은 환경에 맞춰 직접 결정 권장
+# 아래는 변경 없이 상태만 출력
+echo "[8] /etc/ssh/sshd_config 요약:"
+grep -E '^(PermitRootLogin|PasswordAuthentication|Port)\\b' /etc/ssh/sshd_config || true
+systemctl status sshd 2>/dev/null || systemctl status ssh 2>/dev/null || true
+
+# 6) 포트 리스닝/헬스체크 요약
+echo "[8] Listening Ports (expect 22, ${WEB_PORT}, ${SCOUTER_PORT}):"
+ss -lntp | sed -n '1,200p' | egrep ':(22|'"${WEB_PORT}"'|'"${SCOUTER_PORT}"')\\b' || true
+
+echo "[8] STEP8 DONE OK"
+""";
+
+        String b64 = java.util.Base64.getEncoder()
+                .encodeToString(script.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        String cmd = String.join("\n",
+                "base64 -d >/tmp/step8.sh <<'B64'",
+                b64,
+                "B64",
+                "tr -d '\\r' < /tmp/step8.sh > /tmp/.step8.tmp && mv /tmp/.step8.tmp /tmp/step8.sh",
+                "chmod +x /tmp/step8.sh",
+                "echo '[8] bash -n syntax check:'",
+                "bash -n /tmp/step8.sh || { echo '[8][DIAG] numbered dump:'; nl -ba /tmp/step8.sh; exit 1; }",
+                "echo '[8] RUN /bin/bash -x /tmp/step8.sh'",
+                "/bin/bash -x /tmp/step8.sh",
+                "echo '[8] script DONE'"
+        );
+
+        var r = com.innotium.autodeploy.ssh.SSH.execRoot(s, "bash -lc \"" + cmd.replace("\"","\\\"") + "\"", sudoPw);
+        String out = r.out() == null ? "" : r.out().trim();
+        String err = r.err() == null ? "" : r.err().trim();
+        String msg = (!out.isBlank() && !err.isBlank()) ? out + "\\n" + err : (!out.isBlank() ? out : err);
+        if (r.code() != 0) throw new RuntimeException("Security/Firewall 구성 실패(code=" + r.code() + "): " + msg);
+
+        log.accept("  - Security/Firewall 로그:\n" + msg);
+        log.accept("[8] Security/Firewall 설정 완료 ✅");
+    }
 
 
     private String pickMsg(SSH.Result r) {

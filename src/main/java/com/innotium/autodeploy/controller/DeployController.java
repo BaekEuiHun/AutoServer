@@ -131,4 +131,28 @@ public class DeployController {
             }
         }
     }
+    // DeployController.java 내부에 추가
+    @PostMapping("/step8/security")
+    public ResponseEntity<?> step8(@RequestParam String ip,
+                                   @RequestParam String user,
+                                   @RequestParam String sudoPw) {
+        com.jcraft.jsch.Session s = null;
+        try {
+            s = com.innotium.autodeploy.ssh.SSH.open(ip, 22, user, sudoPw);
+            java.lang.reflect.Method m = service.getClass().getDeclaredMethod(
+                    "step08_security",
+                    java.util.function.Consumer.class,
+                    com.jcraft.jsch.Session.class,
+                    String.class,
+                    String.class
+            );
+            m.setAccessible(true);
+            m.invoke(service, (java.util.function.Consumer<String>)System.out::println, s, "unknown", sudoPw);
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Step8 실패: " + e.getMessage());
+        } finally {
+            if (s != null && s.isConnected()) s.disconnect();
+        }
+    }
 }
