@@ -50,6 +50,20 @@ public class DeployController {
             return ResponseEntity.internalServerError().body(error);
         }
     }
+    @PostMapping("/step5/redis")
+    public ResponseEntity<?> step5(@RequestBody com.innotium.autodeploy.dto.Step5RedisRequest req) {
+        com.jcraft.jsch.Session s = null;
+        try {
+            s = com.innotium.autodeploy.ssh.SSH.open(req.ip, 22, req.user, req.sudoPw);
+            service.step05_redis(s, req, System.out::println);
+            return ResponseEntity.ok().build();
+        } catch (Exception e) {
+            return ResponseEntity.internalServerError().body("Step5 실패: " + e.getMessage());
+        } finally {
+            if (s != null && s.isConnected()) s.disconnect();
+        }
+    }
+
     @PostMapping("/step6/mariadb")
     public ResponseEntity<?> step6(@RequestBody Step6MariadbRequest req) {
         Session s = null;
